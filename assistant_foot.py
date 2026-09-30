@@ -2,38 +2,50 @@ import urllib.request
 import os
 import sys
 
-# 🔗 Ton lien RAW GitHub (s'adapte au nom de ton dépôt)
- URL_GITHUB_RAW = "https://raw.githubusercontent.com/halik81/foot-assistant/main/assistant_foot.py"
+# 🔗 Lien RAW GitHub du script (mise à jour automatique)
+URL_GITHUB_RAW = "https://raw.githubusercontent.com/halik81/foot-assistant/main/assistant_foot.py"
+
 
 def verifier_mise_a_jour():
     print("🔍 Vérification des mises à jour sur GitHub...")
     try:
         req = urllib.request.Request(URL_GITHUB_RAW, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             code_distant = response.read().decode('utf-8')
-            
-        nom_fichier_local = sys.argv[0]
-        
-        # Lecture du code local
+    except Exception as e:
+        print(f"⚠️ Impossible de récupérer la mise à jour ({e}). Lancement du script local...")
+        return
+
+    try:
+        nom_fichier_local = os.path.abspath(sys.argv[0])
+
         if os.path.exists(nom_fichier_local):
             with open(nom_fichier_local, 'r', encoding='utf-8') as f:
                 code_actuel = f.read()
         else:
             code_actuel = ""
-            
-        # Mise à jour si le code sur GitHub est plus récent/différent
-        if code_distant.strip() != code_actuel.strip():
-            print("🚀 Nouvelle version détectée ! Mise à jour du script en cours...")
-            with open(nom_fichier_local, 'w', encoding='utf-8') as f:
-                f.write(code_distant)
-            print("✅ Script mis à jour avec succès ! Relancement automatique...")
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-        else:
-            print("✨ Ton script est déjà à jour !")
-    except Exception as e:
-        print(f"⚠️ Impossible de vérifier la mise à jour (connexion ou lien invalide) : {e}")
 
-# Exécution de l'auto-update au démarrage
+        if code_distant.strip() == code_actuel.strip():
+            print("✨ Ton script est déjà à jour !")
+            return
+
+        # Sécurité : on vérifie que le code téléchargé est valide avant d'écraser le fichier local
+        try:
+            compile(code_distant, "assistant_foot_distant", "exec")
+        except SyntaxError as e:
+            print(f"⚠️ La version GitHub contient une erreur de syntaxe (ligne {e.lineno}). Mise à jour annulée, lancement du script local...")
+            return
+
+        print("🚀 Nouvelle version détectée ! Mise à jour du script...")
+        with open(nom_fichier_local, 'w', encoding='utf-8') as f:
+            f.write(code_distant)
+        print("✅ Script mis à jour avec succès ! Relancement...")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        print(f"⚠️ Erreur lors de la mise à jour locale : {e}")
+
+
+# Exécution de la vérification au démarrage
 verifier_mise_a_jour()
 
 # =========================================================
@@ -47,7 +59,41 @@ from sklearn.ensemble import GradientBoostingClassifier
 import warnings
 warnings.filterwarnings('ignore')
 
-API_KEY = "1b5b01361ce9bb88c9f59c85a7a38bc2"
+dossier_download = '/storage/emulated/0/Download/'
+
+
+# ---------------------------------------------------------
+# Clé API : jamais écrite dans le code (le dépôt GitHub est public)
+# Ordre de recherche : variable d'environnement -> fichier local -> saisie
+# ---------------------------------------------------------
+def charger_cle_api():
+    cle = os.environ.get("ODDS_API_KEY", "").strip()
+    if cle:
+        return cle
+
+    fichier_cle = os.path.join(dossier_download, "odds_api_key.txt")
+    if os.path.exists(fichier_cle):
+        try:
+            with open(fichier_cle, 'r', encoding='utf-8') as f:
+                cle = f.read().strip()
+            if cle:
+                return cle
+        except Exception:
+            pass
+
+    print("\n🔑 Aucune clé API The Odds API trouvée.")
+    cle = input("   Colle ta clé API ici : ").strip()
+    if cle:
+        try:
+            with open(fichier_cle, 'w', encoding='utf-8') as f:
+                f.write(cle)
+            print(f"   ✅ Clé enregistrée dans {fichier_cle} (elle ne sera pas publiée sur GitHub).")
+        except Exception:
+            print("   ⚠️ Impossible d'enregistrer la clé, elle sera redemandée au prochain lancement.")
+    return cle
+
+
+API_KEY = charger_cle_api()
 
 CHAMPIONNATS = {
     "1": {"nom": "La Liga (Espagne)", "code_api": "soccer_spain_la_liga", "code_csv": "SP1"},
@@ -102,9 +148,10 @@ choix_jour = input("   Ton choix (1, 2 ou 3) : ").strip()
 aujourdhui = datetime.now().date()
 date_cible = aujourdhui if choix_jour == "2" else (aujourdhui + timedelta(days=1) if choix_jour == "3" else None)
 
-# Chargement & Entraînement
-saisons = [f"{y:02d}{(y+1)%100:02d}" for y in range(12, 26)]
-dossier_download = '/storage/emulated/0/Download/'
+# ---------------------------------------------------------
+# Chargement & entraînement
+# ---------------------------------------------------------
+saisons = [f"{y:02d}{(y + 1) % 100:02d}" for y in range(12, 26)]
 
 dfs_tous = []
 cols_utiles = ['HomeTeam', 'AwayTeam', 'FTR', 'FTHG', 'FTAG', 'HS', 'AS', 'HST', 'AST', 'HC', 'AC', 'B365H', 'B365D', 'B365A']
@@ -112,7 +159,7 @@ cols_utiles = ['HomeTeam', 'AwayTeam', 'FTR', 'FTHG', 'FTAG', 'HS', 'AS', 'HST',
 for config in champs_selectionnes:
     code_csv = config['code_csv']
     fichier_combine = os.path.join(dossier_download, f"BIG_DATA_{code_csv}.csv")
-    
+
     if os.path.exists(fichier_combine):
         df_champ = pd.read_csv(fichier_combine)
     else:
@@ -138,7 +185,7 @@ for config in champs_selectionnes:
 
 if not dfs_tous:
     print("❌ Aucune donnée historique chargée.")
-    exit()
+    sys.exit()
 
 df = pd.concat(dfs_tous, ignore_index=True)
 
@@ -167,6 +214,10 @@ model_X2 = GradientBoostingClassifier(n_estimators=180, learning_rate=0.03, max_
 model_O15 = GradientBoostingClassifier(n_estimators=180, learning_rate=0.03, max_depth=4, random_state=42).fit(X, df_clean['Target_Over15'])
 print("✅ Modèle prêt !")
 
+
+# ---------------------------------------------------------
+# Analyse des matchs
+# ---------------------------------------------------------
 def analyser_matchs(c_min, c_conf, d_cible, auto_ia=False):
     resultats = []
     for config in champs_selectionnes:
@@ -174,90 +225,95 @@ def analyser_matchs(c_min, c_conf, d_cible, auto_ia=False):
         url_api = f"https://api.the-odds-api.com/v4/sports/{sport_api}/odds/?apiKey={API_KEY}&regions=eu&markets=h2h"
         try:
             req = urllib.request.Request(url_api, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=15) as response:
                 matchs_api = json.loads(response.read().decode('utf-8'))
 
-                for match in matchs_api:
-                    commence_a = match.get('commence_time')
-                    if d_cible and commence_a:
-                        date_match = datetime.strptime(commence_a[:10], "%Y-%m-%d").date()
-                        if date_match != d_cible:
-                            continue
+            for match in matchs_api:
+                commence_a = match.get('commence_time')
+                if d_cible and commence_a:
+                    date_match = datetime.strptime(commence_a[:10], "%Y-%m-%d").date()
+                    if date_match != d_cible:
+                        continue
 
-                    h_team = match['home_team']
-                    a_team = match['away_team']
+                h_team = match['home_team']
+                a_team = match['away_team']
 
-                    b365h, b365d, b365a = 2.0, 3.2, 3.5
-                    if match.get('bookmakers'):
-                        for m in match['bookmakers'][0].get('markets', []):
-                            if m['key'] == 'h2h':
-                                for c in m['outcomes']:
-                                    if c['name'] == h_team: b365h = c['price']
-                                    elif c['name'] == a_team: b365a = c['price']
-                                    elif c['name'] == 'Draw': b365d = c['price']
+                b365h, b365d, b365a = 2.0, 3.2, 3.5
+                if match.get('bookmakers'):
+                    for m in match['bookmakers'][0].get('markets', []):
+                        if m['key'] == 'h2h':
+                            for c in m['outcomes']:
+                                if c['name'] == h_team:
+                                    b365h = c['price']
+                                elif c['name'] == a_team:
+                                    b365a = c['price']
+                                elif c['name'] == 'Draw':
+                                    b365d = c['price']
 
-                    cote_1X = round(1 / ((1 / b365h) + (1 / b365d)), 2) if b365h and b365d else 1.25
-                    cote_X2 = round(1 / ((1 / b365a) + (1 / b365d)), 2) if b365a and b365d else 1.25
-                    cote_1X_O15 = round(cote_1X * 1.30, 2)
-                    cote_X2_O15 = round(cote_X2 * 1.30, 2)
+                cote_1X = round(1 / ((1 / b365h) + (1 / b365d)), 2) if b365h and b365d else 1.25
+                cote_X2 = round(1 / ((1 / b365a) + (1 / b365d)), 2) if b365a and b365d else 1.25
+                cote_1X_O15 = round(cote_1X * 1.30, 2)
+                cote_X2_O15 = round(cote_X2 * 1.30, 2)
 
-                    hs_h = stats_equipes.get(h_team, {}).get('HS', df['HS'].mean())
-                    hst_h = stats_equipes.get(h_team, {}).get('HST', df['HST'].mean())
-                    hc_h = stats_equipes.get(h_team, {}).get('HC', df['HC'].mean())
+                hs_h = stats_equipes.get(h_team, {}).get('HS', df['HS'].mean())
+                hst_h = stats_equipes.get(h_team, {}).get('HST', df['HST'].mean())
+                hc_h = stats_equipes.get(h_team, {}).get('HC', df['HC'].mean())
 
-                    as_a = stats_equipes.get(a_team, {}).get('HS', df['AS'].mean())
-                    ast_a = stats_equipes.get(a_team, {}).get('HST', df['AST'].mean())
-                    ac_a = stats_equipes.get(a_team, {}).get('HC', df['AC'].mean())
+                as_a = stats_equipes.get(a_team, {}).get('HS', df['AS'].mean())
+                ast_a = stats_equipes.get(a_team, {}).get('HST', df['AST'].mean())
+                ac_a = stats_equipes.get(a_team, {}).get('HC', df['AC'].mean())
 
-                    input_data = pd.DataFrame([{
-                        'HS': hs_h, 'AS': as_a, 'HST': hst_h, 'AST': ast_a,
-                        'HC': hc_h, 'AC': ac_a, 'B365H': b365h, 'B365D': b365d, 'B365A': b365a
-                    }])
+                input_data = pd.DataFrame([{
+                    'HS': hs_h, 'AS': as_a, 'HST': hst_h, 'AST': ast_a,
+                    'HC': hc_h, 'AC': ac_a, 'B365H': b365h, 'B365D': b365d, 'B365A': b365a
+                }])
 
-                    p_1X = model_1X.predict_proba(input_data)[0][1]
-                    p_X2 = model_X2.predict_proba(input_data)[0][1]
-                    p_O15 = model_O15.predict_proba(input_data)[0][1]
+                p_1X = model_1X.predict_proba(input_data)[0][1]
+                p_X2 = model_X2.predict_proba(input_data)[0][1]
+                p_O15 = model_O15.predict_proba(input_data)[0][1]
 
-                    p_1X_O15 = p_1X * p_O15
-                    p_X2_O15 = p_X2 * p_O15
+                p_1X_O15 = p_1X * p_O15
+                p_X2_O15 = p_X2 * p_O15
 
-                    lignes_prop = []
-                    score_valeur = 0
+                lignes_prop = []
+                score_valeur = 0
 
-                    if p_1X_O15 >= c_conf and cote_1X_O15 >= c_min:
-                        lignes_prop.append(f"   🔥 COMBO BOOSTÉ : 1X & +1.5 Buts | Cote ~{cote_1X_O15} | Confiance : {p_1X_O15*100:.1f}%")
-                        score_valeur = max(score_valeur, p_1X_O15 * cote_1X_O15)
-                    elif p_X2_O15 >= c_conf and cote_X2_O15 >= c_min:
-                        lignes_prop.append(f"   🔥 COMBO BOOSTÉ : X2 & +1.5 Buts | Cote ~{cote_X2_O15} | Confiance : {p_X2_O15*100:.1f}%")
-                        score_valeur = max(score_valeur, p_X2_O15 * cote_X2_O15)
+                if p_1X_O15 >= c_conf and cote_1X_O15 >= c_min:
+                    lignes_prop.append(f"   🔥 COMBO BOOSTÉ : 1X & +1.5 Buts | Cote ~{cote_1X_O15} | Confiance : {p_1X_O15 * 100:.1f}%")
+                    score_valeur = max(score_valeur, p_1X_O15 * cote_1X_O15)
+                elif p_X2_O15 >= c_conf and cote_X2_O15 >= c_min:
+                    lignes_prop.append(f"   🔥 COMBO BOOSTÉ : X2 & +1.5 Buts | Cote ~{cote_X2_O15} | Confiance : {p_X2_O15 * 100:.1f}%")
+                    score_valeur = max(score_valeur, p_X2_O15 * cote_X2_O15)
 
-                    if p_1X >= c_conf and cote_1X >= c_min:
-                        lignes_prop.append(f"   🛡️ SÉCURITÉ : 1X (Dom ou Nul) | Cote ~{cote_1X} | Confiance : {p_1X*100:.1f}%")
-                        score_valeur = max(score_valeur, p_1X * cote_1X)
-                    elif p_X2 >= c_conf and cote_X2 >= c_min:
-                        lignes_prop.append(f"   🛡️ SÉCURITÉ : X2 (Nul ou Ext) | Cote ~{cote_X2} | Confiance : {p_X2*100:.1f}%")
-                        score_valeur = max(score_valeur, p_X2 * cote_X2)
+                if p_1X >= c_conf and cote_1X >= c_min:
+                    lignes_prop.append(f"   🛡️ SÉCURITÉ : 1X (Dom ou Nul) | Cote ~{cote_1X} | Confiance : {p_1X * 100:.1f}%")
+                    score_valeur = max(score_valeur, p_1X * cote_1X)
+                elif p_X2 >= c_conf and cote_X2 >= c_min:
+                    lignes_prop.append(f"   🛡️ SÉCURITÉ : X2 (Nul ou Ext) | Cote ~{cote_X2} | Confiance : {p_X2 * 100:.1f}%")
+                    score_valeur = max(score_valeur, p_X2 * cote_X2)
 
-                    if lignes_prop:
-                        date_str = commence_a[:10] if commence_a else ""
-                        resultats.append({
-                            'champ': config['nom'].split(' ')[0],
-                            'match': f"{h_team} vs {a_team}",
-                            'date': date_str,
-                            'props': lignes_prop,
-                            'p_1X': p_1X,
-                            'p_X2': p_X2,
-                            'score_ia': score_valeur
-                        })
-        except Exception:
-            pass
-            
+                if lignes_prop:
+                    date_str = commence_a[:10] if commence_a else ""
+                    resultats.append({
+                        'champ': config['nom'].split(' ')[0],
+                        'match': f"{h_team} vs {a_team}",
+                        'date': date_str,
+                        'props': lignes_prop,
+                        'p_1X': p_1X,
+                        'p_X2': p_X2,
+                        'score_ia': score_valeur
+                    })
+        except Exception as e:
+            print(f"⚠️ {config['nom']} : impossible de récupérer les cotes ({e})")
+
     if auto_ia:
         resultats = sorted(resultats, key=lambda x: x['score_ia'], reverse=True)[:8]
-        
+
     return resultats
 
+
 derniers_resultats = analyser_matchs(cote_min_input, seuil_confiance, date_cible, auto_ia=mode_auto_ia)
+
 
 def afficher_resultats(liste, est_ia=False):
     titre = "   🤖 SÉLECTION IA AUTO-PILOTE (TOP OPPORTUNITÉS)" if est_ia else f"   PRÉDICTIONS TROUVÉES ({len(liste)} MATCHS)"
@@ -274,9 +330,12 @@ def afficher_resultats(liste, est_ia=False):
                 print(line)
             print("-" * 50)
 
+
 afficher_resultats(derniers_resultats, est_ia=mode_auto_ia)
 
+# ---------------------------------------------------------
 # Boucle interactive
+# ---------------------------------------------------------
 while True:
     print("\n💬 QUE SOUHAITES-TU FAIRE MAINTENANT ?")
     print("0. 🤖 Laisser l'IA sélectionner les meilleures opportunités")
@@ -285,7 +344,7 @@ while True:
     print("3. Analyse détaillée d'un match (saisir le numéro)")
     print("4. Relancer un scan complet")
     print("5. Quitter")
-    
+
     choix_action = input("\n👉 Ton choix (0-5) : ").strip()
 
     if choix_action == "0":
@@ -302,7 +361,7 @@ while True:
             derniers_resultats = analyser_matchs(cote_min_input, seuil_confiance, date_cible, auto_ia=False)
             afficher_resultats(derniers_resultats, est_ia=False)
         except ValueError:
-            print("⚠️️ Valeur invalide.")
+            print("⚠️ Valeur invalide.")
 
     elif choix_action == "2":
         nom_f = input("   Nom du championnat (ex: Premier, La, Serie, Ligue, Bundesliga) : ").strip().lower()
@@ -320,13 +379,13 @@ while True:
                 print(f"\n📊 ANALYSE DÉTAILLÉE : {m_sel['match']}")
                 print(f"   • Championnat : {m_sel['champ']}")
                 print(f"   • Date : {m_sel['date']}")
-                print(f"   • Probabilité 1X : {m_sel['p_1X']*100:.1f}%")
-                print(f"   • Probabilité X2 : {m_sel['p_X2']*100:.1f}%")
+                print(f"   • Probabilité 1X : {m_sel['p_1X'] * 100:.1f}%")
+                print(f"   • Probabilité X2 : {m_sel['p_X2'] * 100:.1f}%")
                 print(f"   • Score d'Efficacité IA : {m_sel['score_ia']:.2f}")
             else:
                 print("⚠️ Numéro invalide.")
         except ValueError:
-            print("⚠ Entrée invalide.")
+            print("⚠️ Entrée invalide.")
 
     elif choix_action == "4":
         print("🔄 Relancement...")
