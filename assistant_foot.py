@@ -3,7 +3,7 @@ import os
 import sys
 
 # 🔗 Ton lien RAW GitHub (s'adapte au nom de ton dépôt)
-URL_GITHUB_RAW = "URL_GITHUB_RAW = "https://raw.githubusercontent.com/halik81/foot-assistant/main/assistant_foot.py"
+ URL_GITHUB_RAW = "https://raw.githubusercontent.com/halik81/foot-assistant/main/assistant_foot.py"
 
 def verifier_mise_a_jour():
     print("🔍 Vérification des mises à jour sur GitHub...")
