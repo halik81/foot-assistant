@@ -391,7 +391,9 @@ def trouver_equipe(nom):
                     res = norm_vers_nom[proche[0]]
     _cache_noms[nom] = res
     return res
-    def similarite(a, b):
+
+
+def similarite(a, b):
     na, nb = norm(a), norm(b)
     na = ALIAS_NORM.get(na, na)
     nb = ALIAS_NORM.get(nb, nb)
@@ -483,7 +485,7 @@ def af_get(endpoint, params, cache=True):
             print("   ⚠️ API-Football : le plan gratuit n'inclut pas la saison en cours.")
             print("   ➡️ Blessures et compos désactivées pour cette analyse (le reste fonctionne).")
         else:
-            print(f"   ⚠️ API-Football : {err}")
+          print(f"   ⚠️ API-Football : {err}")
         return None
     rep = data.get('response', [])
     if cache:
@@ -734,6 +736,7 @@ print(f"✅ {len(analyses)} match(s) analysé(s).")
 pre = [a for a in analyses
        if any(c['cote'] >= cote_min_input and (0.6 * c['p_mod'] + 0.4 * c['p_mkt']) >= seuil_confiance - 0.05
               for c in a['candidats'])]
+
 # Blessures / compos via API-Football (si ton plan le permet)
 if AF_KEY and pre:
     print(f"🚑 Vérification API-Football pour {len(pre)} match(s)...")
@@ -893,3 +896,4 @@ if af_restant[0] is not None:
 print("⚠️ Aucun modèle ne garantit un gain. Les cotes 1X / X2 marquées ≈ sont calculées à partir des cotes 1N2 :")
 print("   vérifie la cote réelle chez ton bookmaker avant de parier, et ne mise que ce que tu peux perdre.")
 print("\n[Fin de l'analyse]")
+
