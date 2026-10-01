@@ -270,6 +270,7 @@ df['Target_1X'] = (df['FTR'].isin(['H', 'D'])).astype(int)
 df['Target_X2'] = (df['FTR'].isin(['A', 'D'])).astype(int)
 df['Total_Goals'] = df['FTHG'] + df['FTAG']
 df['Target_Over15'] = (df['Total_Goals'] > 1.5).astype(int)
+
 # ---------------------------------------------------------
 # FORME RÉCENTE : moyenne sur les N derniers matchs de chaque équipe (domicile + extérieur)
 # Pour l'entraînement, on n'utilise que ce qui était connu AVANT le match (décalage d'un match).
@@ -390,9 +391,7 @@ def trouver_equipe(nom):
                     res = norm_vers_nom[proche[0]]
     _cache_noms[nom] = res
     return res
-
-
-def similarite(a, b):
+    def similarite(a, b):
     na, nb = norm(a), norm(b)
     na = ALIAS_NORM.get(na, na)
     nb = ALIAS_NORM.get(nb, nb)
@@ -451,10 +450,11 @@ AF_BASE = "https://v3.football.api-sports.io"
 cache_af = {}
 _derniere_req_af = [0.0]
 af_restant = [None]
+af_desactive = [False]
 
 
 def af_get(endpoint, params, cache=True):
-    if not AF_KEY:
+    if not AF_KEY or af_desactive[0]:
         return None
     url = f"{AF_BASE}/{endpoint}" + (("?" + urllib.parse.urlencode(params)) if params else "")
     if cache and url in cache_af:
@@ -477,7 +477,13 @@ def af_get(endpoint, params, cache=True):
         return None
 
     if data.get('errors'):
-        print(f"   ⚠️ API-Football : {data['errors']}")
+        err = data['errors']
+        if isinstance(err, dict) and 'plan' in err:
+            af_desactive[0] = True
+            print("   ⚠️ API-Football : le plan gratuit n'inclut pas la saison en cours.")
+            print("   ➡️ Blessures et compos désactivées pour cette analyse (le reste fonctionne).")
+        else:
+            print(f"   ⚠️ API-Football : {err}")
         return None
     rep = data.get('response', [])
     if cache:
@@ -540,7 +546,7 @@ def af_compos(fixture_id):
 
 
 def af_disponible():
-    if not AF_KEY:
+    if not AF_KEY or af_desactive[0]:
         return False
     return af_restant[0] is None or int(af_restant[0]) > 5
 
@@ -599,6 +605,7 @@ def lire_cotes(ma):
 
 def moy(liste):
     return sum(liste) / len(liste) if liste else None
+
 
 # ---------------------------------------------------------
 # ANALYSE DES MATCHS
@@ -714,7 +721,7 @@ for config in champs_selectionnes:
              'forme_h': forme_h, 'forme_a': forme_a, 'ok_h': ok_h, 'ok_a': ok_a, 'connues': ok_h and ok_a,
              'candidats': construire_candidats(h2h, ou, x),
              'abs_dom': {}, 'abs_ext': {}, 'poids_dom': 0.0, 'poids_ext': 0.0,
-             'compos': None, 'af_ok': False}
+             'compos': None, 'af_ok': False, 'manuel': False}
         analyses.append(a)
 
 if not analyses:
@@ -723,17 +730,81 @@ if not analyses:
 
 print(f"✅ {len(analyses)} match(s) analysé(s).")
 
-# Blessures / compos : seulement pour les matchs qui ont une chance de passer les filtres
-if AF_KEY:
-    pre = [a for a in analyses
-           if any(c['cote'] >= cote_min_input and (0.6 * c['p_mod'] + 0.4 * c['p_mkt']) >= seuil_confiance - 0.05
-                  for c in a['candidats'])]
-    if pre:
-        print(f"🚑 Vérification des blessures et compositions pour {len(pre)} match(s) (quelques secondes par match)...")
-        for a in pre:
-            enrichir_af(a)
-else:
-    print("ℹ️ Pas de clé API-Football : blessures et compositions ignorées.")
+# Matchs qui ont une chance de passer les filtres (les seuls pour lesquels les absents comptent)
+pre = [a for a in analyses
+       if any(c['cote'] >= cote_min_input and (0.6 * c['p_mod'] + 0.4 * c['p_mkt']) >= seuil_confiance - 0.05
+              for c in a['candidats'])]
+# Blessures / compos via API-Football (si ton plan le permet)
+if AF_KEY and pre:
+    print(f"🚑 Vérification API-Football pour {len(pre)} match(s)...")
+    for a in pre:
+        enrichir_af(a)
+elif not AF_KEY:
+    print("ℹ️ Pas de clé API-Football : tu peux renseigner les absents à la main ci-dessous.")
+
+
+def lire_absents(lignes):
+    """Lignes 'Equipe: joueur1, joueur2*, joueur3?'  ->  {equipe: {joueur: poids}}."""
+    res, inconnues = {}, []
+    for ligne in lignes:
+        if ':' not in ligne:
+            continue
+        eq, joueurs = ligne.split(':', 1)
+        cle = trouver_equipe(eq.strip())
+        if cle is None:
+            inconnues.append(eq.strip())
+            continue
+        d = res.setdefault(cle, {})
+        for j in joueurs.split(','):
+            j = j.strip()
+            poids = 1.0
+            if j.endswith('*'):
+                poids, j = 2.0, j[:-1].strip()      # joueur clé
+            elif j.endswith('?'):
+                poids, j = 0.5, j[:-1].strip()      # douteux
+            if j:
+                d[j] = poids
+    return res, inconnues
+
+
+if pre:
+    print("\n📋 Matchs à vérifier (ceux qui peuvent passer tes filtres) :")
+    for a in pre:
+        print(f"   • {a['home']} - {a['away']} ({a['debut'].strftime('%d/%m %H:%M')})")
+
+print("\n🩹 ABSENTS (blessés / suspendus) - facultatif")
+print("   Format : Équipe: joueur1, joueur2   (une équipe par ligne)")
+print("   Ajoute * pour un joueur clé (ex: Saka*) ou ? s'il est douteux (ex: Saka?)")
+print("   Appuie sur Entrée sans rien écrire pour terminer / passer.")
+lignes_abs = []
+while True:
+    try:
+        ligne = input("   > ").strip()
+    except EOFError:
+        break
+    if not ligne:
+        break
+    lignes_abs.append(ligne)
+
+absents_manuels, inconnues_abs = lire_absents(lignes_abs)
+for n in inconnues_abs:
+    print(f"   ⚠️ Équipe non reconnue (ligne ignorée) : {n}")
+if absents_manuels:
+    pris = set()
+    for a in analyses:
+        ch, ce = trouver_equipe(a['home']), trouver_equipe(a['away'])
+        md, me = absents_manuels.get(ch, {}), absents_manuels.get(ce, {})
+        if md or me:
+            a['abs_dom'] = {**a['abs_dom'], **md}
+            a['abs_ext'] = {**a['abs_ext'], **me}
+            a['poids_dom'] = sum(a['abs_dom'].values())
+            a['poids_ext'] = sum(a['abs_ext'].values())
+            a['manuel'] = True
+            pris.update([ch, ce])
+    sans_match = [e for e in absents_manuels if e not in pris]
+    print(f"   ✅ Absents pris en compte pour {sum(1 for a in analyses if a['manuel'])} match(s).")
+    if sans_match:
+        print(f"   ℹ️ Pas de match à venir trouvé pour : {', '.join(sans_match)}")
 
 # Sélection finale
 picks = []
@@ -789,8 +860,9 @@ for i, (a, c) in enumerate(picks, 1):
     print(f"   📊 Modèle {c['p_mod'] * 100:.0f}% · Marché {c['p_mkt'] * 100:.0f}% · Valeur {c['ev'] * 100:+.0f}%")
     print(f"   📈 {texte_forme(a['home'], a['forme_h'], a['ok_h'])}")
     print(f"      {texte_forme(a['away'], a['forme_a'], a['ok_a'])}")
-    if a['af_ok']:
+    if a['af_ok'] or a['manuel']:
         print(f"   🚑 Absents : {a['home']} {texte_absents(a['abs_dom'])} | {a['away']} {texte_absents(a['abs_ext'])}")
+    if a['af_ok']:
         if a['compos']:
             print(f"   📋 Compos officielles : {a['compos'][0]} vs {a['compos'][1]}")
         else:
@@ -821,4 +893,3 @@ if af_restant[0] is not None:
 print("⚠️ Aucun modèle ne garantit un gain. Les cotes 1X / X2 marquées ≈ sont calculées à partir des cotes 1N2 :")
 print("   vérifie la cote réelle chez ton bookmaker avant de parier, et ne mise que ce que tu peux perdre.")
 print("\n[Fin de l'analyse]")
-        
