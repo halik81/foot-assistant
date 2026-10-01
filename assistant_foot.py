@@ -270,7 +270,6 @@ df['Target_1X'] = (df['FTR'].isin(['H', 'D'])).astype(int)
 df['Target_X2'] = (df['FTR'].isin(['A', 'D'])).astype(int)
 df['Total_Goals'] = df['FTHG'] + df['FTAG']
 df['Target_Over15'] = (df['Total_Goals'] > 1.5).astype(int)
-
 # ---------------------------------------------------------
 # FORME RÉCENTE : moyenne sur les N derniers matchs de chaque équipe (domicile + extérieur)
 # Pour l'entraînement, on n'utilise que ce qui était connu AVANT le match (décalage d'un match).
@@ -489,4 +488,337 @@ def af_get(endpoint, params, cache=True):
 def af_trouver_fixture(m):
     """Retrouve le match chez API-Football (une seule requête par ligue, mise en cache)."""
     ligue = LIGUES_AF.get(m['code_api'])
-    if not ligue or not m.get('date'): ret
+    if not ligue or not m.get('date'): return None
+    d0 = datetime.strptime(m['date'], "%Y-%m-%d").date()
+    data = af_get("fixtures", {'league': ligue, 'season': annee_saison,
+                               'from': str(aujourdhui - timedelta(days=1)),
+                               'to': str(aujourdhui + timedelta(days=14))})
+    if not data:
+        return None
+    meilleur, score_max = None, 0.0
+    for f in data:
+        try:
+            jour = datetime.fromisoformat(f['fixture']['date']).astimezone().date()
+        except Exception:
+            continue
+        if abs((jour - d0).days) > 1:
+            continue
+        s = (similarite(m['home'], f['teams']['home']['name'])
+             + similarite(m['away'], f['teams']['away']['name']))
+        if s > score_max:
+            meilleur, score_max = f, s
+    return meilleur if score_max >= 1.4 else None
+
+
+def af_blessures(fixture_id):
+    """Absents par équipe : {id_equipe: {nom_joueur: poids}} (1 = absent, 0.5 = incertain)."""
+    rep = af_get("injuries", {'fixture': fixture_id})
+    res = {}
+    for x in (rep or []):
+        try:
+            tid = x['team']['id']
+            nom = x['player'].get('name', '?')
+            poids = 1.0 if 'missing' in str(x['player'].get('type', '')).lower() else 0.5
+        except Exception:
+            continue
+        d = res.setdefault(tid, {})
+        d[nom] = max(d.get(nom, 0), poids)
+    return res
+
+
+def af_compos(fixture_id):
+    """Compositions officielles (publiées environ 1h avant le coup d'envoi)."""
+    rep = af_get("fixtures/lineups", {'fixture': fixture_id}, cache=False)
+    res = {}
+    for x in (rep or []):
+        try:
+            noms = {j['player']['name'] for j in x.get('startXI', [])}
+            res[x['team']['id']] = {'formation': x.get('formation'), 'titulaires': noms}
+        except Exception:
+            continue
+    return res
+
+
+def af_disponible():
+    if not AF_KEY:
+        return False
+    return af_restant[0] is None or int(af_restant[0]) > 5
+
+
+# ---------------------------------------------------------
+# THE ODDS API : matchs à venir + cotes
+# ---------------------------------------------------------
+odds_restant = [None]
+
+
+def recuperer_matchs(code_api):
+    params = {'apiKey': API_KEY, 'regions': 'eu,uk', 'markets': 'h2h,totals',
+              'oddsFormat': 'decimal', 'dateFormat': 'iso'}
+    url = f"https://api.the-odds-api.com/v4/sports/{code_api}/odds/?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            restant = r.headers.get('x-requests-remaining')
+            if restant is not None:
+                odds_restant[0] = restant
+            return json.loads(r.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            print("   ⚠️ The Odds API : clé invalide (supprime odds_api_key.txt pour la ressaisir).")
+        elif e.code == 429:
+            print("   ⚠️ The Odds API : quota épuisé.")
+        else:
+            print(f"   ⚠️ The Odds API : erreur HTTP {e.code}")
+    except Exception as e:
+        print(f"   ⚠️ The Odds API : {e}")
+    return []
+
+
+def lire_cotes(ma):
+    """Liste des cotes (H, D, A) et des cotes (Over 1.5, Under 1.5) de chaque bookmaker."""
+    home, away = ma['home_team'], ma['away_team']
+    h2h, ou = [], []
+    for bk in ma.get('bookmakers', []):
+        for mk in bk.get('markets', []):
+            if mk.get('key') == 'h2h':
+                prix = {o['name']: o['price'] for o in mk.get('outcomes', [])}
+                if home in prix and away in prix and 'Draw' in prix:
+                    h2h.append((prix[home], prix['Draw'], prix[away]))
+            elif mk.get('key') == 'totals':
+                over = under = None
+                for o in mk.get('outcomes', []):
+                    if o.get('point') == 1.5:
+                        if o['name'] == 'Over':
+                            over = o['price']
+                        elif o['name'] == 'Under':
+                            under = o['price']
+                if over and under:
+                    ou.append((over, under))
+    return h2h, ou
+
+
+def moy(liste):
+    return sum(liste) / len(liste) if liste else None
+
+# ---------------------------------------------------------
+# ANALYSE DES MATCHS
+# ---------------------------------------------------------
+def construire_candidats(h2h, ou, x):
+    """Pour chaque pari : cote, probabilité du modèle, probabilité du marché (marge retirée)."""
+    # Probabilités du marché (on enlève la marge du bookmaker, puis on moyenne)
+    ph, pd_, pa = [], [], []
+    for (h, d, a) in h2h:
+        tot = 1 / h + 1 / d + 1 / a
+        ph.append((1 / h) / tot)
+        pd_.append((1 / d) / tot)
+        pa.append((1 / a) / tot)
+    mh, md, ma_ = moy(ph), moy(pd_), moy(pa)
+
+    cands = [
+        {'marche': '1X', 'cote': max(1 / (1 / h + 1 / d) for (h, d, a) in h2h),
+         'p_mod': float(model_1X.predict_proba(x)[0, 1]), 'p_mkt': mh + md, 'estimee': True},
+        {'marche': 'X2', 'cote': max(1 / (1 / d + 1 / a) for (h, d, a) in h2h),
+         'p_mod': float(model_X2.predict_proba(x)[0, 1]), 'p_mkt': md + ma_, 'estimee': True},
+    ]
+    if ou:
+        p_over = moy([(1 / o) / (1 / o + 1 / u) for (o, u) in ou])
+        cands.append({'marche': 'Plus de 1.5 buts', 'cote': max(o for (o, u) in ou),
+                      'p_mod': float(model_O15.predict_proba(x)[0, 1]), 'p_mkt': p_over, 'estimee': False})
+    return cands
+
+
+def ajust_absences(marche, a):
+    """Petit ajustement selon les absents (effet plafonné : on ne connaît pas l'importance de chaque joueur)."""
+    if marche == '1X':
+        delta = 0.008 * (a['poids_ext'] - a['poids_dom'])
+    elif marche == 'X2':
+        delta = -0.008 * (a['poids_ext'] - a['poids_dom'])
+    else:
+        delta = -0.003 * (a['poids_ext'] + a['poids_dom'])
+    return max(-0.05, min(0.05, delta))
+
+
+def proba_finale(c, a):
+    # Modèle (forme + cotes) mélangé avec le marché. Équipe inconnue -> on se fie surtout au marché.
+    w = 0.6 if a['connues'] else 0.25
+    p = w * c['p_mod'] + (1 - w) * c['p_mkt'] + ajust_absences(c['marche'], a)
+    return max(0.01, min(0.99, p))
+
+
+def enrichir_af(a):
+    """Blessures et compositions via API-Football (uniquement pour les matchs intéressants)."""
+    if not af_disponible():
+        return
+    fx = af_trouver_fixture(a)
+    if not fx:
+        return
+    fid = fx['fixture']['id']
+    id_dom, id_ext = fx['teams']['home']['id'], fx['teams']['away']['id']
+    bl = af_blessures(fid)
+    abs_dom, abs_ext = dict(bl.get(id_dom, {})), dict(bl.get(id_ext, {}))
+
+    delai = (a['debut'] - datetime.now().astimezone()).total_seconds()
+    if 0 < delai <= 7200 and af_disponible():
+        compos = af_compos(fid)
+        if compos:
+            tit_dom = compos.get(id_dom, {}).get('titulaires', set())
+            tit_ext = compos.get(id_ext, {}).get('titulaires', set())
+            abs_dom = {n: p for n, p in abs_dom.items() if n not in tit_dom}   # joueur finalement titulaire
+            abs_ext = {n: p for n, p in abs_ext.items() if n not in tit_ext}
+            a['compos'] = (compos.get(id_dom, {}).get('formation'), compos.get(id_ext, {}).get('formation'))
+
+    a['abs_dom'], a['abs_ext'] = abs_dom, abs_ext
+    a['poids_dom'], a['poids_ext'] = sum(abs_dom.values()), sum(abs_ext.values())
+    a['af_ok'] = True
+
+
+print("\n🔎 Récupération des matchs et des cotes...")
+maintenant = datetime.now().astimezone()
+analyses = []
+sans_cote_over = 0
+
+for config in champs_selectionnes:
+    matchs_api = recuperer_matchs(config['code_api'])
+    for ma in matchs_api:
+        try:
+            debut = datetime.fromisoformat(ma['commence_time'].replace('Z', '+00:00')).astimezone()
+        except Exception:
+            continue
+        if debut <= maintenant:
+            continue
+        if date_cible and debut.date() != date_cible:
+            continue
+
+        h2h, ou = lire_cotes(ma)
+        if not h2h:
+            continue
+
+        forme_h, ok_h = info_forme(ma['home_team'])
+        forme_a, ok_a = info_forme(ma['away_team'])
+
+        ligne = {}
+        for c in STATS:
+            ligne['H_' + c] = forme_h['R_' + c]
+            ligne['A_' + c] = forme_a['R_' + c]
+        ligne['B365H'] = moy([t[0] for t in h2h])
+        ligne['B365D'] = moy([t[1] for t in h2h])
+        ligne['B365A'] = moy([t[2] for t in h2h])
+        x = pd.DataFrame([ligne])[features]
+
+        if not ou:
+            sans_cote_over += 1
+
+        a = {'home': ma['home_team'], 'away': ma['away_team'],
+             'date': debut.strftime("%Y-%m-%d"), 'debut': debut,
+             'champ': config['nom'], 'code_api': config['code_api'],
+             'forme_h': forme_h, 'forme_a': forme_a, 'ok_h': ok_h, 'ok_a': ok_a, 'connues': ok_h and ok_a,
+             'candidats': construire_candidats(h2h, ou, x),
+             'abs_dom': {}, 'abs_ext': {}, 'poids_dom': 0.0, 'poids_ext': 0.0,
+             'compos': None, 'af_ok': False}
+        analyses.append(a)
+
+if not analyses:
+    print("\n❌ Aucun match à venir trouvé pour ces critères (essaie 'Tous les prochains matchs').")
+    sys.exit()
+
+print(f"✅ {len(analyses)} match(s) analysé(s).")
+
+# Blessures / compos : seulement pour les matchs qui ont une chance de passer les filtres
+if AF_KEY:
+    pre = [a for a in analyses
+           if any(c['cote'] >= cote_min_input and (0.6 * c['p_mod'] + 0.4 * c['p_mkt']) >= seuil_confiance - 0.05
+                  for c in a['candidats'])]
+    if pre:
+        print(f"🚑 Vérification des blessures et compositions pour {len(pre)} match(s) (quelques secondes par match)...")
+        for a in pre:
+            enrichir_af(a)
+else:
+    print("ℹ️ Pas de clé API-Football : blessures et compositions ignorées.")
+
+# Sélection finale
+picks = []
+for a in analyses:
+    valides = []
+    for c in a['candidats']:
+        c['p'] = proba_finale(c, a)
+        c['ev'] = c['p'] * c['cote'] - 1
+        if c['cote'] >= cote_min_input and c['p'] >= seuil_confiance:
+            valides.append(c)
+    if valides:
+        picks.append((a, max(valides, key=lambda z: z['ev'])))
+
+if mode_auto_ia:
+    bons = [(a, c) for (a, c) in picks if c['ev'] >= 0 and a['connues']]
+    if bons:
+        picks = bons
+    else:
+        print("\n⚠️ Aucune sélection avec une valeur positive : voici les moins mauvaises (à prendre avec prudence).")
+    picks.sort(key=lambda t: t[1]['ev'], reverse=True)
+    picks = picks[:8]
+else:
+    picks.sort(key=lambda t: t[1]['p'], reverse=True)
+
+
+def texte_forme(nom, f, connue):
+    if not connue:
+        return f"{nom} : forme inconnue (moyenne utilisée)"
+    return f"{nom} : {f['R_Pts']:.1f} pts/m, {f['R_GF']:.1f} buts pour, {f['R_GA']:.1f} contre"
+
+
+def texte_absents(d):
+    if not d:
+        return "0"
+    noms = sorted(d, key=lambda n: -d[n])
+    suite = "…" if len(noms) > 3 else ""
+    return f"{len(noms)} ({', '.join(noms[:3])}{suite})"
+
+
+print("\n" + "=" * 50)
+print("🎯 PRONOSTICS")
+print("=" * 50)
+
+if not picks:
+    print("\nAucun pari ne passe tes filtres (cote/confiance). Baisse un peu la confiance ou la cote minimale.")
+
+lignes_csv = []
+for i, (a, c) in enumerate(picks, 1):
+    nb = "≈" if c['estimee'] else ""
+    print(f"\n{i}. ⚽ {a['home']} vs {a['away']}")
+    print(f"   🏆 {a['champ']} | 🕒 {a['debut'].strftime('%d/%m %H:%M')}")
+    print(f"   ✅ Pari : {c['marche']} | Cote {nb}{c['cote']:.2f} | Confiance {c['p'] * 100:.0f}%")
+    print(f"   📊 Modèle {c['p_mod'] * 100:.0f}% · Marché {c['p_mkt'] * 100:.0f}% · Valeur {c['ev'] * 100:+.0f}%")
+    print(f"   📈 {texte_forme(a['home'], a['forme_h'], a['ok_h'])}")
+    print(f"      {texte_forme(a['away'], a['forme_a'], a['ok_a'])}")
+    if a['af_ok']:
+        print(f"   🚑 Absents : {a['home']} {texte_absents(a['abs_dom'])} | {a['away']} {texte_absents(a['abs_ext'])}")
+        if a['compos']:
+            print(f"   📋 Compos officielles : {a['compos'][0]} vs {a['compos'][1]}")
+        else:
+            print("   📋 Compos pas encore publiées")
+    lignes_csv.append({'Match': f"{a['home']} - {a['away']}", 'Championnat': a['champ'],
+                       'Date': a['debut'].strftime('%Y-%m-%d %H:%M'), 'Pari': c['marche'],
+                       'Cote': round(c['cote'], 2), 'Confiance_%': round(c['p'] * 100, 1),
+                       'Modele_%': round(c['p_mod'] * 100, 1), 'Marche_%': round(c['p_mkt'] * 100, 1),
+                       'Valeur_%': round(c['ev'] * 100, 1)})
+
+if lignes_csv:
+    try:
+        chemin_csv = os.path.join(dossier_download, f"pronostics_{aujourdhui.strftime('%Y%m%d')}.csv")
+        pd.DataFrame(lignes_csv).to_csv(chemin_csv, index=False, encoding='utf-8-sig')
+        print(f"\n💾 Résultats enregistrés : {chemin_csv}")
+    except Exception:
+        pass
+
+print("\n" + "-" * 50)
+if equipes_inconnues:
+    print(f"⚠️ Équipes non reconnues (forme moyenne utilisée) : {', '.join(sorted(equipes_inconnues))}")
+if sans_cote_over:
+    print(f"ℹ️ 'Plus de 1.5 buts' ignoré sur {sans_cote_over} match(s) : cote indisponible chez les bookmakers.")
+if odds_restant[0] is not None:
+    print(f"📡 Requêtes The Odds API restantes : {odds_restant[0]}")
+if af_restant[0] is not None:
+    print(f"📡 Requêtes API-Football restantes aujourd'hui : {af_restant[0]}")
+print("⚠️ Aucun modèle ne garantit un gain. Les cotes 1X / X2 marquées ≈ sont calculées à partir des cotes 1N2 :")
+print("   vérifie la cote réelle chez ton bookmaker avant de parier, et ne mise que ce que tu peux perdre.")
+print("\n[Fin de l'analyse]")
+        
